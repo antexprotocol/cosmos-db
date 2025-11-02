@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/spf13/cast"
 )
 
@@ -81,7 +81,7 @@ func NewPebbleDB(name, dir string, opts Options) (DB, error) {
 	do := &pebble.Options{
 		Logger: &fatalLogger{}, // pebble info logs are messing up the logs
 		// (not a cosmossdk.io/log logger)
-		MaxConcurrentCompactions: func() int { return 3 }, // default 1
+		CompactionConcurrencyRange: func() (int, int) { return 3, 3 }, // default 1, 1
 	}
 
 	do.EnsureDefaults()

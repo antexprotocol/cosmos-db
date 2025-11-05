@@ -96,7 +96,7 @@ var _ DB = (*PebbleDB)(nil)
 //   - MaxOpenFiles: 4096 (provides reliable performance boost)
 //   - MemTableSize: 256MB (good balance for write performance)
 //   - BytesPerSync/WALBytesPerSync: tuned for smoother writes
-func defaultPebbleOptions() *pebble.Options {
+func DefaultPebbleOptions() *pebble.Options {
 	numCPU := runtime.NumCPU()
 
 	// Calculate compaction concurrency based on CPU cores
@@ -196,7 +196,7 @@ func defaultPebbleOptions() *pebble.Options {
 }
 
 func NewPebbleDB(name, dir string, opts Options) (DB, error) {
-	do := defaultPebbleOptions()
+	do := DefaultPebbleOptions()
 
 	do.EnsureDefaults()
 

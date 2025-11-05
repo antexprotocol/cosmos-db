@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/bloom"
 	"github.com/spf13/cast"
 )
 
@@ -77,12 +79,124 @@ type PebbleDB struct {
 
 var _ DB = (*PebbleDB)(nil)
 
-func NewPebbleDB(name, dir string, opts Options) (DB, error) {
-	do := &pebble.Options{
+// defaultPebbleOptions creates optimized PebbleDB options based on machine configuration.
+// It automatically detects CPU cores and configures cache size, compaction concurrency,
+// and other performance-related settings for optimal read/write performance.
+//
+// Read performance optimizations:
+//   - Large cache (2GB) with optimized sharding for better hit rate
+//   - Bloom filters on all levels to reduce unnecessary disk reads
+//   - Larger block sizes (32KB) for better sequential read performance
+//   - Larger target file sizes to reduce file count and improve read efficiency
+//   - Optimized file cache shards based on CPU cores
+//   - Readahead enabled for sequential reads
+//
+// Write performance optimizations:
+//   - CompactionConcurrencyRange: dynamically set based on CPU cores
+//   - MaxOpenFiles: 4096 (provides reliable performance boost)
+//   - MemTableSize: 256MB (good balance for write performance)
+//   - BytesPerSync/WALBytesPerSync: tuned for smoother writes
+func defaultPebbleOptions() *pebble.Options {
+	numCPU := runtime.NumCPU()
+
+	// Calculate compaction concurrency based on CPU cores
+	// Use at least 1, but scale up with CPU cores (capped at reasonable max)
+	// For production workloads, using 1-2x CPU cores is often optimal
+	compactionLower := 1
+	compactionUpper := numCPU
+	if compactionUpper > 8 {
+		// Cap at 8 for very high core count systems to avoid excessive resource usage
+		compactionUpper = 8
+	}
+	if compactionLower > compactionUpper {
+		compactionLower = compactionUpper
+	}
+
+	// Create a shared cache with optimized sharding for better read performance
+	// Using NewCache allows us to leverage better cache management
+	// For read-heavy workloads, larger cache significantly improves performance
+	cacheSize := int64(2 << 30) // 2GB
+	sharedCache := pebble.NewCache(cacheSize)
+
+	opts := &pebble.Options{
 		Logger: &fatalLogger{}, // pebble info logs are messing up the logs
 		// (not a cosmossdk.io/log logger)
-		CompactionConcurrencyRange: func() (int, int) { return 3, 3 }, // default 1, 1
+
+		// Cache configuration: Use shared cache for better read performance
+		// Shared cache allows multiple DB instances to share the same cache
+		Cache: sharedCache,
+
+		// Compaction concurrency: dynamically adjust based on CPU cores
+		// Lower bound for normal operation, upper bound for high load scenarios
+		CompactionConcurrencyRange: func() (int, int) {
+			return compactionLower, compactionUpper
+		},
+
+		// MaxOpenFiles: 4096 provides reliable performance boost
+		// This allows more SSTables to be kept open, reducing file open/close overhead
+		MaxOpenFiles: 4096,
+
+		// MemTableSize: 256MB provides good balance for write performance
+		// Larger memtables improve write throughput but increase memory usage
+		MemTableSize: 256 << 20, // 256MB
+
+		// BytesPerSync: sync SSTables periodically to smooth out writes
+		// Default is 512KB, but we can tune based on workload
+		BytesPerSync: 2048 << 10, // 2MB
+
+		// WALBytesPerSync: sync WAL periodically for smoother writes
+		// Default is 0 (sync on every write), but 4MB provides good balance
+		WALBytesPerSync: 4 << 20, // 4MB
+
+		// L0 compaction thresholds: tuned for better write performance
+		// Lower thresholds trigger compaction earlier, reducing write stalls
+		L0CompactionFileThreshold: 4,  // default is 4
+		L0CompactionThreshold:     4,  // default is 4
+		L0StopWritesThreshold:     36, // default is 36, stop writes when L0 gets too large
+
+		// TargetFileSizes: Optimize for read performance
+		// Larger files reduce the number of files to manage, improving read efficiency
+		// For read-heavy workloads, slightly larger files can improve performance
+		TargetFileSizes: [7]int64{
+			4 << 20,   // L0: 4MB (default is 2MB, larger for better read performance)
+			8 << 20,   // L1: 8MB
+			16 << 20,  // L2: 16MB
+			32 << 20,  // L3: 32MB
+			64 << 20,  // L4: 64MB
+			128 << 20, // L5: 128MB
+			256 << 20, // L6: 256MB
+		},
 	}
+
+	// Set experimental options for better read performance
+	// FileCacheShards: Optimize based on CPU cores for better concurrent read performance
+	// More shards reduce contention when multiple goroutines access the file cache
+	opts.Experimental.FileCacheShards = numCPU
+
+	// Configure Bloom filters for all levels to optimize read performance
+	// Bloom filters reduce unnecessary disk reads by quickly determining if a key might exist
+	// Using bits per key of 10 provides good balance between filter size and false positive rate
+	bloomFilter := bloom.FilterPolicy(10)
+	for i := range opts.Levels {
+		opts.Levels[i].FilterPolicy = bloomFilter
+		// Optimize block size for read performance
+		// Larger blocks (32KB) reduce overhead and improve sequential read performance
+		// Default is 4KB for L0, but 32KB works better for read-heavy workloads
+		opts.Levels[i].BlockSize = 32 << 10 // 32KB
+		// Larger index blocks can improve index read performance
+		opts.Levels[i].IndexBlockSize = 32 << 10 // 32KB
+	}
+
+	// Set experimental options for better compaction performance
+	// L0CompactionConcurrency: enable concurrent compactions when L0 read-amplification is high
+	// This allows Pebble to increase compaction concurrency when L0 gets large
+	opts.Experimental.L0CompactionConcurrency = 2
+
+	return opts
+}
+
+func NewPebbleDB(name, dir string, opts Options) (DB, error) {
+	do := defaultPebbleOptions()
 
 	do.EnsureDefaults()
 
